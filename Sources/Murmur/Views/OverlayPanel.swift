@@ -59,21 +59,28 @@ struct WaveformView: View {
 struct OverlayView: View {
     @ObservedObject var pipeline: DictationPipeline
 
+    private var isRecording: Bool { pipeline.state == .recording }
+
     var body: some View {
-        HStack(spacing: 12) {
-            if pipeline.state == .recording {
-                // Recording: red dot + waveform
-                Circle()
-                    .fill(.red)
-                    .frame(width: 8, height: 8)
-                WaveformView(audioLevel: pipeline.audioLevel)
-            } else {
-                // Processing: spinner
+        HStack(spacing: 10) {
+            // Dot transitions color smoothly
+            Circle()
+                .fill(isRecording ? Color.red : Color.blue)
+                .frame(width: 8, height: 8)
+
+            // Waveform fades out, spinner fades in
+            ZStack {
+                WaveformView(audioLevel: isRecording ? pipeline.audioLevel : 0)
+                    .opacity(isRecording ? 1 : 0)
+
                 ProgressView()
-                    .scaleEffect(0.7)
+                    .scaleEffect(0.6)
                     .tint(.white)
+                    .opacity(isRecording ? 0 : 1)
             }
+            .frame(width: 40)
         }
+        .animation(.easeInOut(duration: 0.25), value: isRecording)
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
         .background {

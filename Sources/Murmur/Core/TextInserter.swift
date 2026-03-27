@@ -14,33 +14,55 @@ private func log(_ msg: String) {
 }
 
 class TextInserter: @unchecked Sendable {
+
+    private let terminalBundleIDs: Set<String> = [
+        "com.apple.Terminal",
+        "com.googlecode.iterm2",
+        "io.alacritty",
+        "com.mitchellh.ghostty",
+        "dev.warp.Warp-Stable",
+        "co.zeit.hyper",
+        "net.kovidgoyal.kitty",
+    ]
+
     func insertText(_ text: String, targetPID: pid_t?, targetApp: AXUIElement?, targetElement: AXUIElement?, isTrusted: Bool = false) {
         log("insertText: pid=\(targetPID ?? -1), trusted=\(isTrusted), hasElement=\(targetElement != nil)")
 
         // Activate the target app
         activateApp(pid: targetPID)
 
-        // If trusted, try direct AX insertion first (no clipboard disruption)
-        if isTrusted, let element = targetElement, insertViaAX(text, element: element) {
-            log("AX insert succeeded")
-            return
-        }
+        let isTerminal = isTerminalApp(pid: targetPID)
+        log("isTerminal=\(isTerminal)")
 
-        if isTrusted, let app = targetApp {
-            var focusedEl: AnyObject?
-            if AXUIElementCopyAttributeValue(app, kAXFocusedUIElementAttribute as CFString, &focusedEl) == .success,
-               focusedEl != nil {
-                let element = focusedEl! as! AXUIElement
-                if insertViaAX(text, element: element) {
-                    log("AX insert (re-queried) succeeded")
-                    return
+        // For non-terminal apps with AX trust, try direct insertion (cleanest)
+        if isTrusted && !isTerminal {
+            if let element = targetElement, insertViaAX(text, element: element) {
+                log("AX insert succeeded")
+                return
+            }
+            if let app = targetApp {
+                var focusedEl: AnyObject?
+                if AXUIElementCopyAttributeValue(app, kAXFocusedUIElementAttribute as CFString, &focusedEl) == .success,
+                   focusedEl != nil {
+                    let element = focusedEl! as! AXUIElement
+                    if insertViaAX(text, element: element) {
+                        log("AX insert (re-queried) succeeded")
+                        return
+                    }
                 }
             }
         }
 
-        // Clipboard + paste via osascript (runs as a separate trusted process)
-        log("Using osascript paste")
-        pasteViaOsascript(text, targetPID: targetPID)
+        // Clipboard + paste (works everywhere)
+        log("Using clipboard paste")
+        pasteViaClipboard(text, targetPID: targetPID, isTrusted: isTrusted)
+    }
+
+    private func isTerminalApp(pid: pid_t?) -> Bool {
+        guard let pid = pid,
+              let app = NSRunningApplication(processIdentifier: pid),
+              let bundleID = app.bundleIdentifier else { return false }
+        return terminalBundleIDs.contains(bundleID)
     }
 
     private func activateApp(pid: pid_t?) {
@@ -48,7 +70,7 @@ class TextInserter: @unchecked Sendable {
               let app = NSRunningApplication(processIdentifier: pid) else { return }
         log("Activating \(app.localizedName ?? "?") pid=\(pid)")
         app.activate()
-        usleep(300_000)
+        usleep(300_000) // 300ms
     }
 
     private func insertViaAX(_ text: String, element: AXUIElement) -> Bool {
@@ -61,30 +83,45 @@ class TextInserter: @unchecked Sendable {
         return false
     }
 
-    private func pasteViaOsascript(_ text: String, targetPID: pid_t?) {
+    private func pasteViaClipboard(_ text: String, targetPID: pid_t?, isTrusted: Bool) {
         let pasteboard = NSPasteboard.general
         let previousContents = pasteboard.string(forType: .string)
 
-        // Set clipboard
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
         log("Clipboard set")
 
-        // Use osascript CLI (inherits Terminal's Accessibility trust)
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", """
-            tell application "System Events"
-                keystroke "v" using command down
-            end tell
-        """]
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-            log("osascript exit code: \(process.terminationStatus)")
-        } catch {
-            log("osascript failed: \(error)")
+        if isTrusted, let pid = targetPID {
+            // If we have AX trust, use CGEvent (fastest)
+            let source = CGEventSource(stateID: .combinedSessionState)
+            guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: true),
+                  let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: false) else {
+                log("FAIL: Could not create CGEvents")
+                return
+            }
+            keyDown.flags = .maskCommand
+            keyUp.flags = .maskCommand
+            keyDown.postToPid(pid)
+            keyUp.postToPid(pid)
+            log("Cmd+V via CGEvent to pid \(pid)")
+        } else {
+            // No AX trust — use osascript which has its own permissions
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            process.arguments = ["-e", """
+                tell application "System Events"
+                    keystroke "v" using command down
+                end tell
+            """]
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            do {
+                try process.run()
+                process.waitUntilExit()
+                log("osascript paste exit=\(process.terminationStatus)")
+            } catch {
+                log("osascript failed: \(error)")
+            }
         }
 
         // Restore clipboard
