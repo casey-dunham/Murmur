@@ -1,0 +1,7 @@
+.build/
+Murmur.app/
+*.iconset/
+/tmp/
+test_insert.swift
+/tmp/murmur_debug.log
+.DS_Store
