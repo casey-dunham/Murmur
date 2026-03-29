@@ -113,7 +113,7 @@ struct MenuBarView: View {
             Spacer()
 
             if pipeline.state == .recording {
-                WaveformView(audioLevel: pipeline.audioLevel)
+                WaveformView(audioLevel: pipeline.audioLevel, isProcessing: false)
             }
         }
         .padding(.horizontal, 12)

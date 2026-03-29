@@ -24,11 +24,14 @@ class OverlayPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
-// MARK: - Waveform bars driven by real audio level
+// MARK: - Waveform bars — used for both recording (live audio) and processing (gentle pulse)
 
 struct WaveformView: View {
     let audioLevel: Float
+    let isProcessing: Bool
     let barCount = 7
+
+    @State private var pulsePhase: CGFloat = 0
 
     var body: some View {
         HStack(spacing: 2.5) {
@@ -39,16 +42,48 @@ struct WaveformView: View {
             }
         }
         .frame(height: 28)
-        .animation(.interpolatingSpring(stiffness: 300, damping: 12), value: audioLevel)
+        .animation(.easeOut(duration: 0.12), value: audioLevel)
+        .animation(.easeInOut(duration: 0.8), value: pulsePhase)
+        .onChange(of: isProcessing) { _, processing in
+            if processing {
+                startPulsing()
+            } else {
+                pulsePhase = 0
+            }
+        }
+        .onAppear {
+            if isProcessing { startPulsing() }
+        }
+    }
+
+    private func startPulsing() {
+        // Continuously cycle pulse phase for a gentle breathing animation
+        func cycle() {
+            guard isProcessing else { return }
+            withAnimation(.easeInOut(duration: 0.8)) {
+                pulsePhase = pulsePhase == 0 ? 1 : 0
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { cycle() }
+        }
+        pulsePhase = 0
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { cycle() }
     }
 
     private func barHeight(for index: Int) -> CGFloat {
-        // Amplify the signal — boost low levels so bars react to quiet speech
-        let raw = CGFloat(audioLevel)
-        let boosted = pow(raw, 0.4) // sqrt-ish curve makes quiet sounds more visible
-        // Each bar has a different multiplier for organic wave shape
         let offsets: [CGFloat] = [0.5, 0.75, 1.0, 0.85, 0.95, 0.7, 0.55]
-        let base: CGFloat = 3
+        let base: CGFloat = 4
+
+        if isProcessing {
+            // Gentle pulsing — bars breathe between small and medium height
+            let pulseOffsets: [CGFloat] = [0.3, 0.5, 0.7, 0.6, 0.65, 0.45, 0.35]
+            let low: CGFloat = 4
+            let high: CGFloat = low + 10 * pulseOffsets[index]
+            return low + (high - low) * pulsePhase
+        }
+
+        // Live audio — bars react to mic level
+        let raw = CGFloat(audioLevel)
+        let boosted = pow(max(raw, 0), 0.4)
         let maxExtra: CGFloat = 25
         return base + maxExtra * boosted * offsets[index]
     }
@@ -60,27 +95,36 @@ struct OverlayView: View {
     @ObservedObject var pipeline: DictationPipeline
 
     private var isRecording: Bool { pipeline.state == .recording }
+    private var isProcessing: Bool {
+        switch pipeline.state {
+        case .transcribing, .enhancing, .inserting: return true
+        default: return false
+        }
+    }
+
+    private var dotColor: Color {
+        switch pipeline.state {
+        case .recording: return .red
+        case .transcribing, .enhancing: return .orange
+        case .inserting: return .green
+        default: return .blue
+        }
+    }
 
     var body: some View {
         HStack(spacing: 10) {
-            // Dot transitions color smoothly
             Circle()
-                .fill(isRecording ? Color.red : Color.blue)
+                .fill(dotColor)
                 .frame(width: 8, height: 8)
 
-            // Waveform fades out, spinner fades in
-            ZStack {
-                WaveformView(audioLevel: isRecording ? pipeline.audioLevel : 0)
-                    .opacity(isRecording ? 1 : 0)
-
-                ProgressView()
-                    .scaleEffect(0.6)
-                    .tint(.white)
-                    .opacity(isRecording ? 0 : 1)
-            }
+            // Same waveform bars throughout — live audio when recording, pulse when processing
+            WaveformView(
+                audioLevel: pipeline.audioLevel,
+                isProcessing: isProcessing
+            )
             .frame(width: 40)
         }
-        .animation(.easeInOut(duration: 0.25), value: isRecording)
+        .animation(.easeInOut(duration: 0.3), value: dotColor)
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
         .background {
@@ -116,7 +160,6 @@ class OverlayManager {
     func show() {
         // Cancel any pending hide
         hideGeneration += 1
-        isShowing = true
 
         if panel == nil {
             panel = OverlayPanel()
@@ -124,6 +167,10 @@ class OverlayManager {
             hostingView.frame = NSRect(x: 0, y: 0, width: 240, height: 52)
             panel?.contentView = hostingView
         }
+
+        // Only animate in if not already visible — avoids blink on state transitions
+        guard !isShowing else { return }
+        isShowing = true
 
         if let screen = NSScreen.main {
             let screenFrame = screen.visibleFrame

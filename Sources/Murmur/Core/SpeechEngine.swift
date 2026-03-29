@@ -91,29 +91,48 @@ class SpeechEngine {
         let request = SFSpeechURLRecognitionRequest(url: fileURL)
         request.shouldReportPartialResults = false
 
-        var hasResumed = false
-        var recognitionTask: SFSpeechRecognitionTask?
+        // Use nonisolated(unsafe) to share mutable state with the recognition callback
+        nonisolated(unsafe) var hasResumed = false
+        nonisolated(unsafe) var recognitionTask: SFSpeechRecognitionTask?
 
         return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                recognitionTask = recognizer.recognitionTask(with: request) { result, error in
-                    guard !hasResumed else { return }
+            try await withThrowingTaskGroup(of: String.self) { group in
+                // Timeout task — 15 seconds max
+                group.addTask {
+                    try await Task.sleep(nanoseconds: 15_000_000_000)
+                    throw MurmurError.transcriptionTimedOut
+                }
 
-                    if let error = error {
-                        hasResumed = true
-                        continuation.resume(throwing: error)
-                        return
-                    }
-                    if let result = result, result.isFinal {
-                        hasResumed = true
-                        continuation.resume(returning: result.bestTranscription.formattedString)
-                        return
-                    }
-                    if result == nil && error == nil {
-                        hasResumed = true
-                        continuation.resume(returning: "")
+                // Recognition task
+                group.addTask {
+                    try await withCheckedThrowingContinuation { continuation in
+                        recognitionTask = recognizer.recognitionTask(with: request) { result, error in
+                            guard !hasResumed else { return }
+
+                            if let error = error {
+                                hasResumed = true
+                                continuation.resume(throwing: error)
+                                return
+                            }
+                            if let result = result, result.isFinal {
+                                hasResumed = true
+                                continuation.resume(returning: result.bestTranscription.formattedString)
+                                return
+                            }
+                            if result == nil && error == nil {
+                                // nil result, nil error — empty audio
+                                hasResumed = true
+                                continuation.resume(returning: "")
+                            }
+                            // Non-final partial result — ignore, wait for final or timeout
+                        }
                     }
                 }
+
+                // Return whichever finishes first
+                let result = try await group.next()!
+                group.cancelAll()
+                return result
             }
         } onCancel: {
             recognitionTask?.cancel()
@@ -132,6 +151,7 @@ enum MurmurError: LocalizedError {
     case noRecording
     case speechRecognizerUnavailable
     case speechNotAuthorized
+    case transcriptionTimedOut
     case enhancementFailed(String)
 
     var errorDescription: String? {
@@ -142,6 +162,8 @@ enum MurmurError: LocalizedError {
             return "Speech recognizer is not available"
         case .speechNotAuthorized:
             return "Speech recognition not authorized"
+        case .transcriptionTimedOut:
+            return "Transcription timed out"
         case .enhancementFailed(let reason):
             return "Text enhancement failed: \(reason)"
         }
